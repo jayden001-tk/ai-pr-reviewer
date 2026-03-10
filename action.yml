@@ -1,18 +1,68 @@
 name: "AI PR Reviewer"
-description: "Automatically review pull requests using AI"
+description: "Review GitHub pull requests with OpenAI"
+author: "jayden001-tk"
 
 inputs:
   openai_api_key:
-    description: "OpenAI API Key"
+    description: "OpenAI API key"
     required: true
+
+  github_token:
+    description: "GitHub token for reading PR metadata and posting comments"
+    required: true
+    default: ${{ github.token }}
+
+  model:
+    description: "OpenAI model name"
+    required: false
+    default: "gpt-5"
+
+  max_files:
+    description: "Maximum number of changed files to review"
+    required: false
+    default: "20"
+
+  max_patch_chars:
+    description: "Maximum patch characters per file"
+    required: false
+    default: "12000"
+
+  exclude_patterns:
+    description: "Comma-separated glob patterns to exclude"
+    required: false
+    default: "*.lock,*.min.js,dist/**,build/**,coverage/**,node_modules/**"
+
+  min_severity:
+    description: "Minimum severity to report: low, medium, high"
+    required: false
+    default: "medium"
 
 runs:
   using: "composite"
   steps:
-    - run: pip install openai
-      shell: bash
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
 
-    - run: python review.py
+    - name: Install dependencies
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        pip install openai requests pathspec
+
+    - name: Run AI PR review
       shell: bash
       env:
         OPENAI_API_KEY: ${{ inputs.openai_api_key }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_MAX_FILES: ${{ inputs.max_files }}
+        INPUT_MAX_PATCH_CHARS: ${{ inputs.max_patch_chars }}
+        INPUT_EXCLUDE_PATTERNS: ${{ inputs.exclude_patterns }}
+        INPUT_MIN_SEVERITY: ${{ inputs.min_severity }}
+        GITHUB_EVENT_PATH: ${{ github.event_path }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_API_URL: ${{ github.api_url }}
+      run: |
+        python "${{ github.action_path }}/review.py"
