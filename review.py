@@ -52,24 +52,41 @@ def get_pull_request_files(
     token: str,
 ) -> List[Dict[str, Any]]:
     files: List[Dict[str, Any]] = []
+    per_page = 100
     page = 1
+    url = f"{api_url.rstrip('/')}/repos/{repo}/pulls/{pr_number}/files"
+
+    headers = github_headers(token)
 
     while True:
-        url = f"{api_url}/repos/{repo}/pulls/{pr_number}/files"
-        resp = requests.get(
-            url,
-            headers=github_headers(token),
-            params={"per_page": 100, "page": page},
-            timeout=30,
-        )
-        if resp.status_code >= 300:
-            fail(f"Failed to fetch PR files: {resp.status_code} {resp.text}")
+        params = {"per_page": per_page, "page": page}
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+        except requests.RequestException as e:
+            fail(f"Network error while fetching PR files: {e}")
 
-        batch = resp.json()
-        if not batch:
+        if resp.status_code != 200:
+            # Try to surface GitHub's error message if present
+            try:
+                err = resp.json()
+                message = err.get("message") or str(err)
+            except Exception:
+                message = resp.text
+            fail(f"Failed to fetch PR files: {resp.status_code} {message}")
+
+        try:
+            page_files = resp.json()
+            if not isinstance(page_files, list):
+                fail(f"Unexpected response when fetching PR files: {page_files}")
+        except ValueError:
+            fail("Failed to parse JSON response when fetching PR files")
+
+        files.extend(page_files)
+
+        # If fewer than per_page items returned, we've reached the last page
+        if len(page_files) < per_page:
             break
 
-        files.extend(batch)
         page += 1
 
     return files
