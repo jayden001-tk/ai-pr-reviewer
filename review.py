@@ -2,11 +2,10 @@ import fnmatch
 import json
 import os
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from openai import OpenAI
-
 
 SEVERITY_ORDER = {
     "low": 1,
@@ -52,42 +51,58 @@ def get_pull_request_files(
     token: str,
 ) -> List[Dict[str, Any]]:
     files: List[Dict[str, Any]] = []
-    per_page = 100
     page = 1
-    url = f"{api_url.rstrip('/')}/repos/{repo}/pulls/{pr_number}/files"
-
-    headers = github_headers(token)
-
     while True:
-        params = {"per_page": per_page, "page": page}
-        try:
-            resp = requests.get(url, headers=headers, params=params, timeout=30)
-        except requests.RequestException as e:
-            fail(f"Network error while fetching PR files: {e}")
+        url = f"{api_url}/repos/{repo}/pulls/{pr_number}/files"
+        resp = requests.get(
+            url,
+            headers=github_headers(token),
+            params={"per_page": 100, "page": page},
+            timeout=30,
+        )
+        if resp.status_code >= 300:
+            fail(f"Failed to fetch PR files: {resp.status_code} {resp.text}")
 
-        if resp.status_code != 200:
-            # Try to surface GitHub's error message if present
-            try:
-                err = resp.json()
-                message = err.get("message") or str(err)
-            except Exception:
-                message = resp.text
-            fail(f"Failed to fetch PR files: {resp.status_code} {message}")
-
-        try:
-            page_files = resp.json()
-            if not isinstance(page_files, list):
-                fail(f"Unexpected response when fetching PR files: {page_files}")
-        except ValueError:
-            fail("Failed to parse JSON response when fetching PR files")
-
-        files.extend(page_files)
-
-        # If fewer than per_page items returned, we've reached the last page
-        if len(page_files) < per_page:
+        batch = resp.json()
+        if not batch:
             break
 
+        files.extend(batch)
         page += 1
+
+    return files
+
+
+def get_compare_files(
+    api_url: str,
+    repo: str,
+    base_sha: str,
+    head_sha: str,
+    token: str,
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Return the files changed between two commits using GitHub Compare API.
+    On synchronize events, this represents the incremental delta pushed to the PR branch.
+    """
+    url = f"{api_url}/repos/{repo}/compare/{base_sha}...{head_sha}"
+    resp = requests.get(
+        url,
+        headers=github_headers(token),
+        timeout=30,
+    )
+
+    if resp.status_code >= 300:
+        log(
+            "Compare API failed; will fall back to full PR review. "
+            f"status={resp.status_code}"
+        )
+        return None
+
+    data = resp.json()
+    files = data.get("files")
+    if not isinstance(files, list):
+        log("Compare API returned no file list; will fall back to full PR review.")
+        return None
 
     return files
 
@@ -129,9 +144,10 @@ def trim_patch(patch: str, max_chars: int) -> str:
 def build_review_payload(
     files: List[Dict[str, Any]],
     max_patch_chars: int,
+    review_mode: str,
+    review_note: str,
 ) -> Dict[str, Any]:
     result_files = []
-
     for f in files:
         result_files.append(
             {
@@ -144,7 +160,11 @@ def build_review_payload(
             }
         )
 
-    return {"files": result_files}
+    return {
+        "review_mode": review_mode,
+        "review_note": review_note,
+        "files": result_files,
+    }
 
 
 def build_prompt(min_severity: str) -> str:
@@ -152,6 +172,10 @@ def build_prompt(min_severity: str) -> str:
 You are an expert pull request reviewer for open-source repositories.
 
 Review the provided GitHub pull request diff carefully.
+
+Important:
+- The payload may represent either the full PR diff or only the incremental delta from the latest PR update.
+- If review_mode is "incremental", focus only on issues introduced by the newly pushed changes.
 
 Focus only on:
 1. correctness bugs
@@ -192,7 +216,6 @@ def call_openai_review(
     min_severity: str,
 ) -> Dict[str, Any]:
     prompt = build_prompt(min_severity)
-
     response = client.responses.create(
         model=model,
         input=[
@@ -248,10 +271,57 @@ def filter_findings_by_severity(
     return result
 
 
+def short_sha(sha: str) -> str:
+    return sha[:7] if sha else ""
+
+
+def resolve_review_scope(
+    event: Dict[str, Any],
+    api_url: str,
+    repo: str,
+    pr_number: int,
+    github_token: str,
+) -> Tuple[str, str, List[Dict[str, Any]]]:
+    """
+    Returns:
+      review_mode: "full" | "incremental"
+      review_note: human-readable note for comment/logging
+      files: list of changed files with patches
+    """
+    action = event.get("action", "")
+    pr = event.get("pull_request", {}) or {}
+
+    if action == "synchronize":
+        before_sha = event.get("before") or ""
+        after_sha = event.get("after") or pr.get("head", {}).get("sha", "")
+
+        if before_sha and after_sha and before_sha != after_sha:
+            files = get_compare_files(
+                api_url=api_url,
+                repo=repo,
+                base_sha=before_sha,
+                head_sha=after_sha,
+                token=github_token,
+            )
+            if files is not None:
+                note = (
+                    f"Incremental review of latest push "
+                    f"(`{short_sha(before_sha)}` → `{short_sha(after_sha)}`)"
+                )
+                return "incremental", note, files
+
+        log("Could not resolve incremental range; falling back to full PR review.")
+
+    files = get_pull_request_files(api_url, repo, pr_number, github_token)
+    return "full", "Full review of current PR diff", files
+
+
 def format_markdown_comment(
     review: Dict[str, Any],
     reviewed_files_count: int,
     skipped_files_count: int,
+    review_mode: str,
+    review_note: str,
 ) -> str:
     summary = review.get("summary", "No summary provided.")
     findings = review.get("findings", [])
@@ -259,6 +329,8 @@ def format_markdown_comment(
     lines = [
         "## AI PR Review",
         "",
+        f"**Scope:** {review_mode}",
+        f"**Mode detail:** {review_note}",
         f"**Summary:** {summary}",
         "",
         f"- Reviewed files: `{reviewed_files_count}`",
@@ -287,9 +359,9 @@ def format_markdown_comment(
         lines.extend(
             [
                 f"{idx}. **[{severity}] {title}**",
-                f"   - File: `{file_name}`" if file_name else "   - File: `unknown`",
-                f"   - Why: {explanation}",
-                f"   - Suggestion: {suggestion}",
+                f" - File: `{file_name}`" if file_name else " - File: `unknown`",
+                f" - Why: {explanation}",
+                f" - Suggestion: {suggestion}",
                 "",
             ]
         )
@@ -339,13 +411,20 @@ def main() -> None:
     if not pr_number:
         fail("Could not determine pull request number")
 
-    log(f"Fetching changed files for PR #{pr_number} ...")
-    pr_files = get_pull_request_files(api_url, repo, pr_number, github_token)
+    review_mode, review_note, candidate_files = resolve_review_scope(
+        event=event,
+        api_url=api_url,
+        repo=repo,
+        pr_number=pr_number,
+        github_token=github_token,
+    )
 
-    reviewable_files = []
-    skipped_files = []
+    log(f"Review mode: {review_mode} ({review_note})")
 
-    for f in pr_files:
+    reviewable_files: List[Dict[str, Any]] = []
+    skipped_files: List[Dict[str, Any]] = []
+
+    for f in candidate_files:
         if should_review_file(f, exclude_patterns):
             reviewable_files.append(f)
         else:
@@ -360,6 +439,9 @@ def main() -> None:
             [
                 "## AI PR Review",
                 "",
+                f"**Scope:** {review_mode}",
+                f"**Mode detail:** {review_note}",
+                "",
                 "No eligible files found for review after filtering.",
             ]
         )
@@ -367,7 +449,12 @@ def main() -> None:
         log("No reviewable files found.")
         return
 
-    payload = build_review_payload(reviewable_files, max_patch_chars)
+    payload = build_review_payload(
+        files=reviewable_files,
+        max_patch_chars=max_patch_chars,
+        review_mode=review_mode,
+        review_note=review_note,
+    )
 
     log(f"Sending {len(reviewable_files)} files to OpenAI model: {model}")
     client = OpenAI(api_key=openai_api_key)
@@ -380,6 +467,8 @@ def main() -> None:
         review=review,
         reviewed_files_count=len(reviewable_files),
         skipped_files_count=len(skipped_files),
+        review_mode=review_mode,
+        review_note=review_note,
     )
 
     log("Posting review comment to PR ...")
